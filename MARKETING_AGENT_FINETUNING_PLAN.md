@@ -141,7 +141,8 @@ Length-normalized DPO (Tülu 3 `dpo_norm`, β≈5) or standard DPO β=0.1, 1 epo
 Merge LoRA (`swift export --merge_lora`, Axolotl `merge-lora`) → **FP8-dynamic** via llm-compressor (≈ lossless on every proxy found; INT4 only after your own BFCL/τ² run on the quantized artifact, calibrated on agent traces) → evaluate the *served* model through the production vLLM flags → deploy. Multi-LoRA (`--enable-lora --max-lora-rank 64`) for A/B canaries only; merged weights for production. Trainers drop the `mtp.*` tensors — re-attach the original MTP head and re-measure acceptance, or serve without speculative decoding.
 
 ```bash
-# production serve (text-only agent)
+# production serve (text-only agent; for screenshots/vision drop --language-model-only
+# and add the multimodal flags in Part II §8)
 vllm serve /models/acme-marketing-27b-fp8 --port 8000 --max-model-len 131072 \
   --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder \
   --language-model-only --enable-prefix-caching --mamba-cache-mode align \
@@ -254,7 +255,128 @@ Managed landscape: **Tinker** supports Qwen3.5/3.6/3.8-27B, LoRA-only, SFT/DPO/R
 
 ---
 
+# Part II — Holo (H Company): how they trained Qwen for computer use, what it costs, and what transfers
+
+**Research date 2026-10-13.** Three additional threads: Holo's own releases (model cards/blog via search snippets — hcompany.ai and huggingface.co are blocked from this sandbox; H's GitHub repos were cloned and read directly), the comparable open Qwen computer-use recipes that *do* publish hyperparameters and compute, and the Hermes Agent vision/browser code path. Same [S]/[U] flags.
+
+## II.1 Lineage — every Holo release
+
+| Release | Date | Base (per size) | Open sizes / license | Training disclosed | Data disclosed | Compute disclosed | Headline numbers (vendor) |
+|---|---|---|---|---|---|---|---|
+| **Holo1** | Jun 2025 (arXiv 2506.02865) | Qwen2.5-VL-3B / 7B-Instruct | 3B Qwen Research licence; **7B Apache-2.0** | **SFT only** ("Filtered Behavioral Cloning" = train only on validator-verified successful traces); one model serves policy + localizer + validator | **31.46B tokens**: GUI grounding 50.8% (WebCrawl 12.19B from 4M pages / 89M clicks; open-source 3.42B; WebSynthetic 0.37B for calendars/tables), visual understanding 32.3%, behaviour 16.9% (policy 15.5% = WebVoyager 643 tasks + WebVoyagerExtended 15k tasks / 330 sites; validator 1.45% ≈ >1M pairs) | none | WebVoyager 92.2% @ $0.13/task (7B), 89.7% @ $0.11 (3B) vs GPT-4.1 92.0% @ $0.54. Ablation: traces-only model 87.7% |
+| **Holo1.5** | Sep 2025 | Qwen2.5-VL-3B / 7B / 72B | 7B Apache-2.0; 72B CC-BY-NC | "multi-stage pipeline"; secondary: SFT → GRPO-style RL [S] | "open-source + large-scale synthetic + proprietary"; no sizes | none | Localization avg 72.8 / 77.3 / 80.5 vs base 57.0 / 60.7 / 70.9; ScreenSpot-Pro 51.4 / 57.9 (3B/7B) vs 29.3 / 29.0 |
+| **Holo2** | Nov 2025 | Qwen3-VL-**Thinking** 4B / 8B / 30B-A3B | 4B, 8B Apache-2.0; 30B-A3B licence conflicting [U] | "large-scale SFT, followed by **online RL (GRPO)**… tailored for localization"; thinking **off** for localization, on for navigation; coords **normalized 0–1000** | "open-source + synthetic + human-annotated"; no sizes | none | 30B-A3B: ScreenSpot-Pro 66.1, OSWorld-G 76.1; 8B nav: WebVoyager 80.2 / WebArena 42.2 / OSWorld 39.9 / AndroidWorld 60.4 |
+| Holo2-235B-A22B preview | Feb 2026 | Qwen3-VL-235B-A22B-Thinking | research-only | adds "agentic localization" (multi-step coordinate refinement) | — | none | ScreenSpot-Pro 70.6 → 78.5 within 3 refinement steps |
+| **Holo3** | Mar 31 2026 | 35B-A3B: Qwen3.5-35B-A3B; 122B-A10B base unconfirmed [U] | 35B Apache-2.0; 122B API-only | "agentic learning flywheel": synthetic navigation data, programmatic out-of-domain augmentation, "every sample is filtered and run through a reinforcement-learning pipeline"; "Synthetic Environment Factory" | no sizes | none | OSWorld-Verified 78.85 (122B) / 77.8 (35B) |
+| **Holo3.1** | Jun 1 2026 | Qwen3.5 0.8B / 4B / 9B / 35B-A3B | all Apache-2.0 | adds **native function-calling** ("near-parity" with strict JSON); FP8 / NVFP4 quants ≈ −2 pts vs BF16 | none | none | AndroidWorld 79.3 (35B), 71–72 (4B/9B); OSWorld 74.2 (35B) [S] |
+| **Holo4** | **Sep 28 2026** | **Holo4-27B = Qwen3.8-27B dense**; Holo4-35B-A3B = **Qwen3.6-35B-A3B**; Holotron4-30B-A3B = Nemotron 3 Nano Omni | 35B-A3B **Apache-2.0**; 27B reported **CC-BY-NC-4.0** [U] | **SFT 127B tokens → asynchronous online RL with prime-rl training two LoRA experts** (desktop+web; terminal+MCP+API) **merged at equal weight, no further training** | SFT ≈ ¾ successful agentic trajectories: desktop 45% / web 14% / MCP+API 12% / mobile 3%; rest multimodal reasoning, GUI grounding, text tool-use & coding. "Agentic Task Factory": **~10,000 verifiable tasks** (≈4k web apps, 3k MCP servers, 3k desktop/OS); "a task survives only if its verifier rejects near misses" | none (prime-rl named) | **OSWorld 85.2% @ $0.08/task (27B) vs base Qwen3.8-27B 84.3% @ $0.22**; 35B 80.8; OSWorld 2.0 61.7 / 30.9; AndroidWorld 85.1; AutomationBench held-out 49.3 / 31.7 (480 of 600 public tasks were in training) |
+
+**What H has never disclosed, in any release:** learning rate, epochs, batch size, schedule, training image resolution, full-FT vs LoRA for SFT (only Holo4's RL uses LoRA), GPU type / count / hours, dollar cost, wall-clock, RL reward formulas, environment counts, dataset sizes after Holo1. **No training code exists publicly** — only inference/deploy notebooks (`hai-cookbook`), the archived Surfer-H CLI, and the **WebClick** eval set (1,639 web screenshots). H says it uses TRL + vLLM (interview) and prime-rl (Holo4). So "replicating Holo" means reconstructing the recipe from their disclosed token counts plus the open recipes in §II.4.
+
+## II.2 The Holo recipe, read across releases
+
+1. **Filtered behavioural cloning** (Holo1 → Holo4): run an agent, keep only validator-verified successes, SFT on them. This is the same thing as the rejection-sampling SFT in Part I §4.5 — Holo is independent confirmation that it works for GUI agents at 3B–27B.
+2. **Grounding-heavy mixture** (Holo1: ~51% grounding, ~32% screen understanding, ~17% behaviour) → by Holo4 the mixture inverted to ~75% trajectories once grounding was mature in the base. For Qwen3.6-27B (already AndroidWorld 70.3 / OSWorld-Verified ~63.9 [S]) you are in the Holo4 regime: trajectories matter, grounding is a small slice.
+3. **In-domain traces are worth real points**: Holo1 attributes ~4.5 pts of WebVoyager to in-domain WebVoyager traces [S]. Generate traces on *your* marketing tools.
+4. **Targeted synthetic data for failure modes** (WebSynthetic: complex calendars, relational tables) → date pickers, campaign tables, budget forms, audience builders.
+5. **Verifiable task factory + online RL** (Holo3/4): environments and tasks built from docs, screenshots and real software; verifiers that reject near misses; GRPO (Holo2) → async RL (Holo4). RL bought *efficiency* more than accuracy on the 27B (+0.9 pt, −64% cost/task).
+6. **LoRA experts per lane, merged** (Holo4): one LoRA for GUI (desktop+web), one for tools (terminal+MCP+API), equal-weight merge, no further training. Cheapest proven RL path on a dense 27B of this exact architecture.
+7. **Policy / localizer / validator split with validator-gated retries** (Surfer-H/Surfer 2): localizer gets the policy's *textual* description of the target and returns coordinates; validator judges task completion from the last 3 screenshots; retries up to 10. A 3B policy went 68.2% (1 attempt) → 75.2% (2) → 82.1% (5) → ~92% (10) on WebVoyager; swapping the GPT-4o validator for the small model cost 12–16 pts.
+8. **Harness details** (read from `surfer-h-cli` source): screenshot-only observation, last **3** screenshots in context, explicit `notes` memory field, `thought` before action, forced answer at step (30) / time (600 s) limits, 2 s settle after each action, guardrails ("never log in", accept cookies, ≤3 scrolls), strict JSON actions via `response_format`, `smart_resize` client-side.
+9. **Format**: Holo3.1 shows native function-calling reaches near-parity with strict JSON → train on Qwen's native tool-call format (`qwen3_coder` parser), as Part I already does. Thinking on for navigation, **off** for localization.
+10. **Quantization**: FP8 / NVFP4 ≈ −2 pts (Holo3.1) → FP8 production is fine, matching Part I.
+
+## II.3 Filling the gaps Holo leaves: what the open Qwen computer-use recipes publish
+
+| Recipe (base) | Stage & hyperparameters actually published | Result |
+|---|---|---|
+| Aguvis (Qwen2-VL-7B) | 2-stage SFT: grounding mix → trajectories; **lr 1e-5, 1 epoch, cosine, warmup 0.03, vision tower frozen**, ZeRO-3, max len 8192, 8 GPUs/node | — |
+| ScaleCUA (Qwen2.5-VL 3B/7B/32B) | SFT lr 1e-5, 3B 1 epoch / 7B-32B 2 epochs, **max_pixels 2.1M**, max len 30–40k, ViT frozen, MLP+LLM tuned | OSWorld-G 60.6 (32B) |
+| GUI-Actor (Qwen2.5-VL 3B/7B) | warm-up lr 1e-4 (pointer head only) → full lr 5e-6, 1 epoch each, max_pixels 5.7M | ScreenSpot-Pro 44.6→47.7 (7B w/ verifier) |
+| **GUI-R1** (Qwen2.5-VL 3B/7B) | **GRPO on 3K samples**: reward = 0.8·accuracy + 0.2·format; click correct if ≤140 px from GT point or inside GT box; text F1 ≥ 0.5; n=5 rollouts, **lr 1e-6**, KL 1e-2, max_pixels 1.26M, 8 GPUs | large grounding gains from tiny data |
+| UI-R1 / UI-R1-E (Qwen2.5-VL-3B) | GRPO on **136 samples**, 8 generations; E: 4 epochs difficulty-adaptive length reward + 4 epochs no-think | ScreenSpot-Pro 17.8 → 29.8 → 33.5 |
+| **GTA1** (Qwen2.5-VL 7B–72B) | grounding GRPO, **no thinking**, 2 epochs, 8 gens, max completion 128, β=0, ViT frozen; **≈800 H100-hours for the family** [S] | 7B SS-Pro 55.5; 32B 63.6 / OSWorld-G 65.2 |
+| ZeroGUI (UI-TARS-7B-DPO) | online RL: VLM-generated tasks + binary VLM reward (Qwen2.5-VL-32B judge), 64 samples/prompt, lr 2e-6, 15-step episodes | +14% rel. OSWorld |
+| ARPO (UI-TARS-1.5-7B) | GRPO + experience replay on 128 OSWorld tasks; **8 nodes × 8 GPUs, 128 Docker envs** | OSWorld 23.5 → 26.0 (GRPO) → 29.9 |
+| OpenCUA (Qwen2.5-VL 7B/32B/72B, MIT incl. data) | SFT on AgentNet 22.6K human tasks (~18.6 steps avg) + reflective CoT; 3-screenshot history | OSWorld-Verified 7B 27.9 / 32B 34.8 / 72B 45.0 (50 steps) |
+| GUI-Owl-1.5 (Qwen3-VL + env RL) | undisclosed hparams; cleanest size curve | **OSWorld-Verified 2B 43.5 → 4B 48.2 → 8B 52.3 → 32B 56.5** |
+| Qwen3.6-27B (your base, stock) | — | **OSWorld-Verified ~63.9 [S], AndroidWorld 70.3** — already above every 2025 open 32B fine-tune |
+
+Convergent recipe: full FT with the vision tower frozen (no published recipe used LoRA for SFT), grounding SFT at lr 1e-5 for 1 epoch, trajectory SFT 1–2 epochs with reflective CoT and a 3-screenshot window, then GRPO — rule-reward grounding GRPO on thousands of samples (hours on 8 GPUs) and/or online environment RL (64 GPUs × days + 100+ env slots). Online RL is what separates 2025 SFT-only 7B models (~27% OSWorld-Verified) from 2026 7–8B models (52–53%). Only two hard compute disclosures exist anywhere: GTA1 ≈ 800 H100-h; GUI-C² 4×H20 for 17 h (3B) / 26 h (7B).
+
+## II.4 How Hermes Agent actually uses vision (this decides whether pixel grounding is worth training)
+
+Read from `hermes-agent` source (`tools/browser_tool_vision.py`, `tools/vision_tools.py`, `agent/image_routing.py`, `tools/computer_use/schema.py`, docs):
+
+- **The browser toolset is accessibility-tree based.** Pages are text snapshots with ref IDs (`@e1`); `browser_click` clicks a ref. Docs: "relies on accessibility tree, not pixel coordinates." **No `click(x,y)` exists in the browser toolset** → a Holo-style pixel localizer is *unused* by Hermes' browser tools.
+- **Screenshots do reach the model** via `browser_vision` / `vision_analyze` — attached natively as `image_url` parts (JPEG ≤256 KB, ≤1568 px wide, ~1,372 Qwen3.6 tokens, re-sent every turn until eviction) **only if Hermes believes the model supports vision.** Routing never auto-probes vLLM endpoints; unknown ⇒ lossy text description. **Set `model.supports_vision: true` (or `agent.image_input_mode: native`)** for a self-hosted Qwen3.6, and verify your vLLM build accepts `image_url` parts on `tool`-role messages.
+- **Pixel coordinates are consumed only by** the separate `computer_use` toolset (drives the host desktop; `coordinate: [x, y]` or set-of-marks index; ~1,500 tokens/screenshot), a custom tool you write (localizer → `browser_cdp` mouse event), or Browser-Use `browser_exec` scripts.
+- **Hermes is an officially supported host for Holo** (`holo install hermes`, `agents-api-demos/hermes/`): H's Agents API runtime (closed binary, open SDK) runs Holo as a sub-agent/MCP server inside Hermes today.
+
+## II.5 Cost model — Holo-scale replication vs. the targeted marketing version
+
+Assumptions: FLOPs ≈ 6·N·tokens full FT (LoRA ≈ 4·N), +~8% for the ViT, H100 bf16 989 TFLOPS at **30% MFU** for image-heavy packed data (range 20–40%), $3.25/H100-h, $4.50/H200-h. Qwen3.5/3.6 vision = **32 px per token**: 1366×768 → 1,032 tokens; 1568×882 (Hermes cap) → 1,372; 1920×1080 raw → 2,040 (capped at `max_pixels=1280·32·32` → 1,222); 2560×1440 → 3,600. A 10-step trajectory packed as one multi-turn sample with Hermes-cap screenshots ≈ **17.7k tokens** (raw 1080p ≈ 24.4k); a 3-screenshot sliding window ≈ 8.1k; unrolling each step as its own sample ≈ 102k — never do that.
+
+**(a) What Holo itself cost in training compute (reconstructed from their token counts; [U-arith] — H discloses nothing):**
+
+| Run | Tokens | H100-hours (20–40% MFU) | Compute $ | Notes |
+|---|---|---|---|---|
+| Holo1-3B SFT | 31.46B | ~410–820 | ~$1.3–2.7k | tiny; 44 authors, so the cost was people + data |
+| Holo1-7B SFT | 31.46B | ~1,000–2,000 | ~$3.3–6.5k | WebVoyager 92.2% from this |
+| Holo4-27B SFT | **127B** | **~14,600–29,000** | **~$47–95k** | ≈13 days on 64×H100 at 30% MFU |
+| Holo4-35B-A3B SFT (3B active) | 127B | ~3–5k (MoE efficiency) | ~$10–16k | |
+| Holo4-style async RL (undisclosed) | ~1,000 steps × 512 rollouts × ~20k tok | ~6–8k GPU-h + sandbox fleet (200 VMs × ~400 h × $0.17–0.46) | **~$35–60k** | |
+| **Data generation** for ~95B tokens of *successful* trajectories at ~30% success | ~300B generated tokens on self-hosted 27–35B models | — | **~$100–300k** + environments + human annotation | the dominant cost; plus 10,000 verifiable tasks |
+
+Replicating Holo4 end-to-end is therefore a **$0.3–0.6M compute-equivalent, multi-engineer effort** — and on a dense 27B it bought +0.9 OSWorld points. Not the right target for a marketing agent.
+
+**(b) The targeted version for your agent (from the infra thread's arithmetic):**
+
+| Job | 27B (LoRA, ViT frozen) | 4B dedicated localizer (full FT) | 8B localizer (full FT) |
+|---|---|---|---|
+| Grounding SFT, 100k screenshot→click samples × 2 epochs (340M tok) | ~35 h → **$114** ($85–171) | 8.6 h → **$28** | 16 h → **$53** |
+| Grounding SFT, 500k × 2 epochs (1.7B tok) | 175 h → **$569** | 43 h → **$140** | 81 h → **$264** |
+| Trajectory SFT, 10k trajectories × 10 steps × 3 epochs, Hermes-cap screenshots (531M tok) | 55 h → **$178** (raw 1080p: $245) | 13 h → **$44** | 27 h → **$84** |
+| GRPO grounding, 500 steps (64 prompts × 8 rollouts) | 8×H100 w/ offload ~$500–650; **8×H200 ~$800–900** (colocated vLLM copy + trainer don't fit 80 GB) | 4×H100 ~28 h → **~$120** | **~$240** |
+| OSWorld-Verified **pass^3** sweep (1,107 runs) | model ~$21–60 + env ~**$160** (780 t3.xlarge-h + 4 hosts), ~5 h wall-clock at 160 envs | same env cost; model ≈ $5–10 | |
+| WebVoyager pass^3 (1,929 runs) | model ~$19 + browsers $6 (Browser Use) – $39 (Browserbase) | | |
+| Memory | 54.6 GB weights + ~16 GB activations for a 17.7k-token trajectory + LoRA/Adam ≈ **73 GB → marginal on H100-80, comfortable on H200** | Adam states 64 GB → 2×H100 or 1×H200; EasyR1: 7B GRPO full bf16 on 4×40 GB, LoRA on 2×32 GB | 128 GB states → 2–4×H100 |
+| **Total one-off** | **≈ $1.1–2.5k compute** + sandbox fees + 2–4 engineer-weeks | **≈ $0.3–0.6k** | ≈ $0.6–1k |
+
+**What you can train for a given budget (the "how much can we train" ladder):**
+- **$0** — Option C below (a11y-tree browser tools + native screenshots for understanding) plus an off-the-shelf localizer if ever needed: Holo2-4B/8B (Apache-2.0), Holo4-35B-A3B (Apache-2.0), Holo3.1-4B/9B (Apache-2.0). Avoid Holo4-27B (CC-BY-NC reported [U]) and Holo1.5-72B (CC-BY-NC) for commercial use.
+- **~$500** — fine-tune a Qwen3.5-4B localizer on screenshots of *your* tools (grounding SFT + 500-step GRPO + eval).
+- **~$2–3k** — Option A on the 27B: grounding + trajectory SFT (LoRA) + 500-step GRPO + two OSWorld sweeps.
+- **~$10–20k** — add online environment RL on your marketing sandboxes (ARPO/ZeroGUI scale: 64 GPUs × days + 100+ env slots) as a GUI-lane LoRA expert, Holo4-style.
+- **$50–100k+** — Holo4-scale SFT (127B tokens). Not advisable: your base is already at ~63.9 OSWorld-Verified and H's own RL on this architecture gained <1 point.
+
+## II.6 Decision: how to add computer-use to the marketing agent
+
+| Option | What it is | Training cost | Fit with Hermes | Risks |
+|---|---|---|---|---|
+| **(C) a11y-tree tools + native screenshots — ship now** | Hermes default `browser_*` (ref clicks) + `browser_vision`/`vision_analyze` feeding the 27B real screenshots for *understanding* | **$0** (config + serving flags) | native, zero harness changes | canvas/WebGL editors, image-only ad builders, CAPTCHA, bad a11y trees |
+| **(B) small dedicated localizer — add when a tool fails on refs** | 27B policy says `click("blue Publish button")` → Holo-class 4B/8B localizer returns (x, y) → `browser_cdp` mouse event or `computer_use coordinate` | $0 off-the-shelf (Holo2/3.1/Holo4-35B Apache) or **~$0.3–0.6k** to fine-tune on your screenshots | needs a ~few-hundred-line custom Hermes tool; `computer_use` already takes `coordinate` but drives the host desktop | +0.3 s/click; long-tail SaaS UI quality |
+| **(A) train grounding + trajectories into the 27B — defer** | Holo/UI-TARS-style SFT + GRPO click reward on the same 27B | **~$1.1–2.5k** compute + env fees + 2–4 engineer-weeks | pixel skill **unused by the browser toolset**; only `computer_use`/custom tools consume it | multi-task mixing vs marketing SFT; GRPO on a 27B VLM needs 8×H200 or a 16×H100 split; marginal gain over an already-GUI-trained base is uncertain |
+
+**Recommended sequence:** ship **C** now; include a few hundred–few thousand Hermes-format browser trajectories (ref clicks + `browser_vision` use) on your marketing tools in the Stage-1 SFT mix (≈ $20–50 of compute); run against real tools; add **B** only for tools that fail on a11y refs; keep **A** as a later experiment, and if you run it, follow Holo4's pattern — two LoRA experts (GUI lane, tool/MCP lane) trained with async RL and merged at equal weight.
+
+## II.7 Holo methods folded into Part I's stages
+
+- **Stage 1 SFT:** add the browser lane (Hermes-format trajectories); keep grounding a small slice unless Option A; add WebSynthetic-style targeted data for date pickers / campaign tables / budget forms; keep the 3-screenshot window and `notes` field in trajectory format.
+- **Stage 4 RL:** Holo4's **per-lane LoRA experts + equal-weight merge**; verifiers that **reject near misses**; an **efficiency term** in the reward (Holo4 rewarded whichever lane solved the task most efficiently; cost/task fell 0.22 → 0.08).
+- **Harness:** **validator-gated retries with a separate validator** (Hermes sub-agent via `delegate_task`, or a stronger model) — the single biggest reliability lever in Surfer-H (+10–24 pts over attempts); forced answer at step/time limits; "never log in / never publish without approval" guardrails in the system prompt *and* the reward.
+- **Serving (Option C):** drop `--language-model-only`; add `--limit-mm-per-prompt '{"image": 6}' --mm-processor-cache-gb 0 --mm-encoder-tp-mode data --mm-processor-kwargs '{"longest_edge": 1310720, "shortest_edge": 262144}'` (= 1280·32·32 / 256·32·32 pixels); Hermes `model.supports_vision: true`. Prefix caching on the hybrid model is block-granular (528-token blocks) and a new screenshot invalidates everything after it — expect cache hits only on the system prompt + earlier history.
+
+## II.8 Holo-specific caveats
+- All Holo numbers are vendor-reported from H's own harness (2–4 runs); AutomationBench had 480/600 public tasks in training; a third-party review flagged an average-column mismatch in the Holo1 paper [U].
+- Holo4-27B licence (CC-BY-NC-4.0) and Holo2-30B-A3B licence are from secondary sources / conflicting metadata — verify on the model cards before any commercial use.
+- Every compute and cost figure in §II.5 is reconstructed arithmetic; H has published none.
+- hcompany.ai, huggingface.co, arxiv.org were unreachable from this sandbox; Holo facts are from verbatim mirrors, H's GitHub repos, and search snippets.
+
+---
+
 ## Appendix A — Flagged / unverified items
+- **Part II:** Holo4-27B and Holo2-30B-A3B licences [U]; all Holo compute/cost reconstructions [U-arith]; Qwen3.6-27B OSWorld-Verified 63.9 is relayed from the Qwen3.8-27B card [S]; Holo1.5 release date conflicts across H pages; whether vLLM accepts `image_url` parts on `tool`-role messages for Qwen3.6 [U]; sandbox/browser pricing figures [S].
 - Paper numbers marked [S] (Gekhman, Ovadia, EntiGraph, LoRA-Without-Regret blog figures, "Procedural Knowledge Is Not Low-Rank", OPD recovery numbers, Ibrahim replay ratios, When2Call deltas, ToolRL deltas, KTO claims, τ-bench numbers, Creativity Benchmark, AD-Bench, CRMArena-Pro) come from abstracts/snippets — arxiv.org and huggingface.co were blocked in this sandbox.
 - Unsloth 56 GB LoRA figure and Tinker pricing/retirement dates [U].
 - Meta's official Ads MCP details (29 tools, admin budget caps) rest on third-party sources [U].
@@ -262,4 +384,6 @@ Managed landscape: **Tinker** supports Qwen3.5/3.6/3.8-27B, LoRA-only, SFT/DPO/R
 - No published documented agentic SFT recipe for Qwen3.6-27B exists yet; closest is Mercor's SkyRL RL run on Qwen3.6-35B-A3B [S].
 
 ## Appendix B — Key sources
-Qwen3.6-27B model card (via mirror); TRL `trl/chat_templates/qwen3_6.jinja`; QwenLM/Qwen3.8 README; vLLM recipes `Qwen/Qwen3.5.md`; vLLM `tool_calling.md`, `reasoning_outputs.md`, `automatic_prefix_caching.md`; ms-swift Qwen3.8 Best Practice; Axolotl `examples/qwen3.5/`; TRL PR #7533/#7599; NousResearch/hermes-agent docs (`providers.md`, `agent-loop.md`, `trajectory-format.md`, `skills.md`, `memory.md`, `prompt_builder.py`, `chat_completions.py`, `batch_runner.py`); NousResearch/Gym, NousResearch/RL; Kimi K2 tech report PDF; Thinking Machines "LoRA Without Regret" (via TRL guide + replication) and "On-Policy Distillation" (via Tinker cookbook); Tülu 3 docs; Toucan datagen; APIGen-MT; BFCL repo; τ²-bench repo; Sierra pass^k code; Anthropic "Writing effective tools for agents", "Advanced tool use", "Agent Skills", "Demystifying evals for AI agents"; Shopify Engineering "Building production-ready agentic systems"; OWASP LLM Top 10; MCP spec 2025-06-18; EDPB Opinion 28/2024 summaries; Presidio.
+**Part II:** H Company GitHub (`hcompai/surfer-h-cli`, `hai-cookbook`, `holo-desktop-cli`, `hai-agents-python`, `agents-api-demos`, `android-world-traces`); Holo model cards / H newsroom / HF blogs via search (Holo1 arXiv 2506.02865; Surfer 2 arXiv 2510.19949; hcompany.ai/newsroom/holo3, holo3.1, holo4); ByteDance UI-TARS paper PDF (repo); OpenCUA repo; QwenLM/Qwen3-VL cookbooks (`computer_use.ipynb`, `agent_function_call.py`); Tongyi-MAI/MAI-UI; X-PLUG GUI-Owl-1.5 README; Aguvis, ScaleCUA, GUI-Actor, GUI-R1 (`r1gui.py` reward), UI-R1, GTA1, ZeroGUI, ARPO scripts; OSWorld / WindowsAgentArena / AndroidWorld / WebVoyager repos; Agent S3 paper (EC2 scaling data); Hermes Agent `tools/browser_tool_vision.py`, `tools/vision_tools.py`, `agent/image_routing.py`, `tools/computer_use/schema.py`, docs `browser.md`/`vision.md`/`computer-use.md`; transformers `configuration_qwen3_5.py`; vLLM recipes `Qwen3.5.md`/`Qwen3-VL.md`, vLLM issue #40696; ms-swift, LLaMA-Factory, Axolotl, EasyR1, verl (`qwen3_5.py` patch) docs.
+
+**Part I:** Qwen3.6-27B model card (via mirror); TRL `trl/chat_templates/qwen3_6.jinja`; QwenLM/Qwen3.8 README; vLLM recipes `Qwen/Qwen3.5.md`; vLLM `tool_calling.md`, `reasoning_outputs.md`, `automatic_prefix_caching.md`; ms-swift Qwen3.8 Best Practice; Axolotl `examples/qwen3.5/`; TRL PR #7533/#7599; NousResearch/hermes-agent docs (`providers.md`, `agent-loop.md`, `trajectory-format.md`, `skills.md`, `memory.md`, `prompt_builder.py`, `chat_completions.py`, `batch_runner.py`); NousResearch/Gym, NousResearch/RL; Kimi K2 tech report PDF; Thinking Machines "LoRA Without Regret" (via TRL guide + replication) and "On-Policy Distillation" (via Tinker cookbook); Tülu 3 docs; Toucan datagen; APIGen-MT; BFCL repo; τ²-bench repo; Sierra pass^k code; Anthropic "Writing effective tools for agents", "Advanced tool use", "Agent Skills", "Demystifying evals for AI agents"; Shopify Engineering "Building production-ready agentic systems"; OWASP LLM Top 10; MCP spec 2025-06-18; EDPB Opinion 28/2024 summaries; Presidio.
