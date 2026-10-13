@@ -1,6 +1,11 @@
-# Fine-tuning Qwen3.6-27B into a marketing-specialist agent for Hermes Agent
+# Fine-tuning Qwen3.8-27B as the brain of a custom Hermes-based marketing-operations system
 
-**Research-backed plan — research date 2026-10-12**
+**Research-backed plan — research dates 2026-10-12 / 2026-10-13**
+
+> **How to read this document.** It was written in three passes and the base model changed on 2026-10-13 from Qwen3.6-27B to **Qwen3.8-27B** (your decision; same weights architecture, different chat template).
+> - **Part III is the execution plan** — start there. It covers Qwen3.8-27B specifics, how to capture and create training data for a custom multi-agent Hermes wrapper, representation of agents/workflows/long sessions, the training stack, evaluation, costs and timeline.
+> - **Part I** is the foundation (what goes in weights vs context, methodology evidence, data pipeline, training recipe, infra, governance). It was written for Qwen3.6-27B; every architecture/VRAM/cost statement applies unchanged to Qwen3.8-27B, but **template rendering rules are superseded by Part III §III.1**, and the note in Part I §4.3 about Hermes' trajectory export is corrected in Part III §III.2.
+> - **Part II** is the Holo (H Company) computer-use research and the decision on how to add GUI capability.
 
 > **Confidence legend.** Six parallel research threads were run against primary sources where reachable (GitHub repos, model cards via verbatim mirrors, trainer docs, the Kimi K2 tech-report PDF, Hermes Agent source at commit `3f2abce7`). This sandbox blocks arxiv.org and huggingface.co, so paper numbers marked **[S]** come from abstracts/search snippets, and **[U]** could not be verified. Unmarked statements were read from a primary source.
 
@@ -83,7 +88,7 @@ Known serving bugs to pin around: `<tool_call>` emitted inside `<think>` (fixed 
 ~20 personas × ~15 workflows (campaign setup, segmentation, subject-line tests, budget reallocation, performance reporting, content calendar, brand-compliance review, attribution questions). For each: intent, ground-truth action sequence, expected end state, and a **rubric** (success criteria, expected tool pattern, policy constraints such as "never send without approval"). Validate blueprints by execution + an LLM reviewer committee (≤3–5 rounds). Target **3–5k verified blueprints**. Marketing *analytics* tasks are verifiable (the right number is computable from the seeded rows) — that is your cleanest RL signal later.
 
 ### 4.3 Trajectory generation (Hermes `batch_runner.py` + Toucan/Kimi K2 pattern)
-- Teacher = a frontier agentic model running **inside Hermes Agent** against the real sandbox tools (`--distribution` to vary toolsets, `--ephemeral_system_prompt` for teacher-only hints, `--max_turns`), persona-conditioned user simulator with best-of-N.
+- Teacher = a frontier agentic model running **inside Hermes Agent** against the real sandbox tools (`--distribution` to vary toolsets, `--ephemeral_system_prompt` for teacher-only hints, `--max_turns`), persona-conditioned user simulator with best-of-N. **Correction (Part III §III.2):** use `batch_runner` only to *drive* runs — its trajectory export substitutes a fixed Hermes-JSON tool-calling system prompt for the real one, re-renders tool calls as JSON and records no token IDs. Record the training data at a capturing gateway under your wrapper.
 - **Teacher licensing is a real decision**: check your provider's terms before distilling from Claude/GPT/Gemini into an in-house model. Open-weight teachers (Qwen3.5-397B-A17B, DeepSeek V4, GLM-4.7, Kimi K2.x) avoid the question and also enable on-policy distillation (which needs teacher logprobs). Kimi K2's recipe — 3,000+ real MCP tools + 20,000+ synthetic tools, persona users, a stateful simulator injecting controlled failures, rubric-judge rejection sampling — is reproducible at your scale.
 - Inject tool failures/partial failures in ~15–25% of runs and **keep the recovery turns**; include parallel and nested calls; keep thinking on tool-call steps within a turn; compress long middles with `trajectory_compressor.py --target_max_tokens 16000`, but keep a slice of uncompressed 32k traces.
 
@@ -375,7 +380,249 @@ Replicating Holo4 end-to-end is therefore a **$0.3–0.6M compute-equivalent, mu
 
 ---
 
+# Part III — Execution plan: Qwen3.8-27B as the brain of your custom Hermes-based marketing-operations system
+
+**Research date 2026-10-13.** Base model changed to **Qwen3.8-27B**. Three further threads: Qwen3.8-27B fine-tuning specifics (read almost entirely from primary sources — the HF card via a verbatim GitHub mirror, TRL's byte-exact vendored chat template, framework source code and configs), the complete taxonomy of dataset-creation methods for agentic systems, and how to capture training data from / run RL through a *custom* multi-agent harness. Parts I and II remain valid foundations (identical architecture) except where this Part says otherwise. Same [S]/[U] flags.
+
+## III.0 The mental model (read this first)
+
+1. **A fine-tuning dataset for an agentic system is a pile of recorded episodes.** Each episode is one conversation between *your system* and *the model*: everything your wrapper sent (system-prompt tiers, tool schemas, workflow text, memory, earlier turns, tool results) and everything the model replied (reasoning, text, tool calls), turn by turn, until the task ended. Training shows the model the exact prompt side and penalizes it only where *its own turns* differ from the recorded good turns. Nothing else is learned from.
+2. **So the dataset must be in your system's exact format**, rendered byte-for-byte the way vLLM renders Qwen3.8's chat template at serving time — same system-block order, same effort sentence, same tool XML, same `<think>` framing. Train/serve format drift is the #1 silent failure in agent fine-tuning (verl documents single-turn PPO failing to converge from exactly this).
+3. **Good episodes come from only three places:** (a) real usage of your system (production logs), (b) a strong teacher model driving *your* system against sandboxed tools (synthetic but *executed* and *verified*), (c) humans demonstrating (gold). Everything else in the method menu (§III.4) is a way to generate more *tasks* for (b), to *derive* episodes from documents/workflows, or to *filter and label* what you have.
+4. **"Verified" is the whole game.** Keep an episode only if a program checked the sandbox end state (the campaign exists with the right budget; the email was *drafted*, not sent; the numbers match the rows), a judge checked the rubric, and no policy was violated (no unapproved irreversible action). Unverified synthetic episodes teach confident mistakes.
+5. **The model learns habits; the context carries facts** (Part I §3). Weights learn: how to plan, which tool with which arguments, when to ask, when to stop, your voice, how to behave as orchestrator vs specialist. Skills/retrieval/system prompt carry company facts, SOPs, brand book, tool schemas.
+6. **Seven steps, in order:** Capture → Environment → Generate → Verify → Represent → Train → Evaluate. Each section below gives the evidence and the concrete artefact to build. Glossary in §III.12.
+
+## III.1 Qwen3.8-27B — what you must know before touching data
+
+### Facts
+- `Qwen/Qwen3.8-27B` (BF16, 55.6 GB, 27.78B params) and `Qwen/Qwen3.8-27B-FP8` (30.9 GB); Apache-2.0; released 2026-08-14; **no `-Base`**. Architecture identical to Qwen3.6-27B — NVIDIA and Tinker both state "only the chat template changed" — so every VRAM/cost number in Parts I–II applies unchanged.
+- Card benchmarks, Qwen3.8-27B vs Qwen3.6-27B: Terminal-Bench 2.1 **73.0** vs 63.4 · SWE-bench Pro **61.7** vs 53.5 · CoWorkBench **70.7** vs 61.0 · JobBench 33.4 vs 21.8 · IFBench **79.5** vs 69.1 · GPQA 89.2 vs 87.8 · OSWorld-Verified **84.3** vs 63.9 · WebArena-Verified **64.8** vs 48.8 · AndroidWorld 81.9 vs 70.3 · ClawEval-MM Pass@3 57.4 vs 42.6. Not on the card: BFCL, τ², SkillsBench, SWE-bench Verified (early viral "80+" tables were fakes [S]).
+- Card highlights: "stronger autonomous planning and better handling of environment feedback", "broader support for popular harnesses", flexible thinking control. No post-training/RL details are published.
+
+### Template rules that decide how every sample is rendered (byte-exact, from TRL's vendored copy of the shipped template)
+1. **`reasoning_effort` ∈ {`xhigh` (default), `medium`, `low`} — nothing else.** `high`, `none`, `max`, `minimal` make the template raise → vLLM HTTP 500 (QwenLM#217; Claude Code's default `high` hits this). `medium` injects **no** text; `xhigh` injects *"Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer."*; `low` injects *"Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration."*
+2. **System block order = effort sentence → `# Tools` block (each tool dumped *with* its OpenAI `{"type":"function","function":…}` wrapper) → your system-prompt text.** An empty system message renders nothing; no system message + xhigh/low → a synthetic system turn holding only the sentence.
+3. **Reasoning is read only from `message.reasoning_content`.** Inline `<think>…</think>` inside `content` is no longer parsed (Qwen3.6 parsed it) — it would be trained as visible text after an empty think block. Store reasoning as a separate field.
+4. **`preserve_thinking` defaults to true**: every historical assistant turn renders `<think>\n{reasoning}\n</think>\n\n`; turns without reasoning render `<think>\n\n</think>\n\n`. The card: "especially beneficial for agent scenarios… also improves KV cache utilization".
+5. **Tool calls** render as `<tool_call>\n<function=NAME>\n<parameter=K>\nV\n</parameter>\n</function>\n</tool_call>`; `arguments` must be a **dict** (JSON-string arguments are not parsed; `''` tolerated); non-strings become JSON literals. Text before a call is allowed; multiple calls newline-joined; no tool_call_id anywhere.
+6. **Tool results**: consecutive `tool` messages merge into **one `user` turn** of stacked `<tool_response>` blocks in message order — restore call order before rendering (results of parallel calls completing out of order would attach to the wrong call).
+7. **Roles**: `system` must be first; `developer` or anything else raises. Fold developer text into `system`.
+8. **Generation prompt** always opens inside `<think>\n` (or `<think>\n\n</think>\n\n` with `enable_thinking:false`) → the server needs `--reasoning-parser qwen3` or reasoning lands in `content`. `/no_think` does not exist.
+9. **Not token-prefix-stable across turns**: a sampled non-reasoning turn continues `<think>\n` + `\n`, while history renders `<think>\n\n</think>\n\n` whose `\n\n` is one token — multi-turn RL must bridge tokens (slime `TrajectoryManager`, prime-rl `bridge_to_next_turn`), never re-render.
+
+### Known production bugs to design around
+- **~19% empty answers at `xhigh`** on vLLM/llama.cpp (EOS sampled inside `<think>`; 0% at `medium`/`low`; QwenLM#216, closed "not planned"). Mitigations: `frequency_penalty 0.3`, `repetition_penalty 1.05–1.10`, a thinking budget, or lower effort.
+- **Phantom tool calls** when the model quotes tool markup inside reasoning (vLLM #58147, open; ~1–2 per 1,600 requests, more when quoting). Mitigation in your wrapper: validate tool names against the offered set and de-duplicate identical calls.
+- MTP speculative decoding (92.2% acceptance BF16, `num_speculative_tokens: 3`) needs the Gated-DeltaNet spec fix (vllm#51812/#51674) that no released tag carried as of 2026-10-08.
+
+### Decisions that follow
+- **Train and serve at `reasoning_effort: medium`.** Avoids the xhigh empty-answer bug; it is what the public slime Qwen3.8-27B agent-RL recipe and H Company's Holo4 RL used; the card warns lower effort "does not always reduce overall task completion time" in agentic tasks, so measure `medium` vs `xhigh` in Stage 0 but default to `medium`. Render a minority of samples at `xhigh`/`low` with matching trace lengths if you want effort-conditioned behaviour.
+- **`preserve_thinking: true`** in training renders and serving — which means your wrapper must pass `reasoning_content` back in assistant history (stock Hermes strips it on custom routes; §III.2).
+- **Keep the native XML tool grammar + `qwen3_coder` parser.** Every framework, quant and fine-tune of this model assumes it; Hermes never sees the grammar.
+- **Serving baseline:** `vllm serve <model> --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder --default-chat-template-kwargs '{"reasoning_effort":"medium"}' --max-model-len 131072 --enable-prefix-caching --mamba-cache-mode align --enable-mamba-shared-prefix-checkpoint --prefix-match-unit 64` (vLLM ≥0.17, verified builds ~0.27; TP must divide 24; BF16 ≈52 GiB, FP8 ≈29 GiB on one GPU). Sampling: thinking T=1.0 / top_p 0.95 / top_k 20 (+ `frequency_penalty 0.3` if empty answers appear). `reasoning_effort` is accepted as a top-level API field and forwarded to the template; `none` turns thinking off.
+
+### Framework support for Qwen3.8-27B (verified in source unless flagged)
+
+| Framework | Status for Qwen3.8-27B | Use it for |
+|---|---|---|
+| **ms-swift** (Qwen's recommendation) | `qwen3_8` template; per-row `{"chat_template_kwargs": {"reasoning_effort": "medium"}}`; `--add_non_thinking_prefix true --loss_scale ignore_empty_think`; `--target_modules all-linear` covers GDN; packing needs ≥4.3.1; GKD = on-policy distillation; GRPO with vLLM colocate; Megatron for full FT/CP; env: transformers ≥5.9, FLA ≥0.4.2 (Py 3.12), flash-attn 2.8.3 | **Primary SFT / DPO / OPD stack** |
+| **Unsloth** | 27B notebooks (Conversational + GRPO); 4-bit QLoRA fits 2×16 GB at 1k seq (23.7 GiB peak); r=8–16, lr 2e-4 (2e-5 long runs), bs1×GA4 (248k-vocab logits dominate); `finetune_attention_modules=True` reaches `linear_attn` (496 modules); **never fp16** (GDN NaN gradients); use a build ≥ Sep 2026 (`in_proj_z` quant-state fix, NaN fix PR #12856); merged export ≈52 GB | Fast single-GPU iteration |
+| **NeMo AutoModel / Megatron-Bridge / NeMo RL** | `qwen3_8_27b.yaml` full SFT (FSDP2, 8×H100, 100-step curves published) + `qwen3_8_27b_lora.yaml` (r=8); Megatron-Bridge import/export verified; NeMo RL `grpo-qwen3.8-27b-2n8g-megatron-tp4pp2cp2.yaml` | **Full fine-tuning** (workflow compilation), multi-node RL |
+| **Axolotl** | `examples/qwen3.8/27b-qlora.yaml` (`chat_template: tokenizer_default`, `chat_template_kwargs.reasoning_effort`; uncomment `linear_attn.*` targets; CCE) | Alternative SFT |
+| **TRL** | `qwen3_8.jinja` + `qwen3_8_training.jinja` (auto with `assistant_only_loss=True`; think block inside the loss span); response parsing via `qwen3_5_schema`; **no GDN padding-free fix found** — don't pack in TRL unless you verify boundaries | Library use |
+| **LLaMA-Factory** | `qwen3_8` class fixes system/tools order and merges parallel results; run-global `--reasoning_effort`; empty think block in loss when thinking on; text + tool_call in one turn **unverified** | Acceptable, less control |
+| **Tinker** | Qwen3.8-27B registered with `qwen3_8_{xhigh,medium,low}_reasoning` / `disable_thinking` renderers; LoRA-only; LoRA LR = 10× full-FT LR; multi-turn tool-use SFT/OPD/RL recipes | Zero-infra LoRA RL/OPD |
+| **slime** | `examples/coding_agent_rl`: **Qwen3.8-27B GRPO through Claude Code / Codex as the harness**, SGLang rollouts (`qwen3_coder`/`qwen3` parsers), `reasoning_effort=medium`, 2×8 GPUs training (TP2 PP8) + 2 sandbox nodes, lr 1e-6, token-in/token-out, compaction at 70% → new segment; no LoRA | **Full-FT RL through a harness** |
+| **verl** | `run_qwen3_8_27b_megatron.sh` (GRPO, lr 1e-6, KL 0.01); AgentLoop for custom loops | Megatron RL baseline |
+| **prime-rl** | `[renderer] name = "qwen3.8"`, per-row `reasoning_effort` column; trainer lists Qwen3.5 (same arch) — confirm load; what H Company used for Holo4's LoRA experts [S] | Async LoRA RL |
+| **llm-compressor** | `qwen3_8_gptq_awq_example.py` W4A16 (ignore `visual.*`, `lm_head`, `embed_tokens`, `linear_attn.in_proj_a/b`); official FP8; NVFP4 (NVIDIA), INT4 (RedHat) | Deployment quantization |
+
+Existing fine-tunes of this exact model: **Holo4-27B** (SFT 127B tokens + two RL LoRA experts via prime-rl merged equal-weight; CC-BY-NC [S]); a community r=16 DPO LoRA that shortens CoT (−2 pts coding [S]); a 195M-token distilled agentic-reasoning fine-tune [S]. None publish agentic benchmarks beyond their cards.
+
+## III.2 Step 1 — Capture: a recording gateway under your wrapper
+
+**Why a gateway, not Hermes' own export.** Every 2026 "train any harness" system converges on one mechanism: an OpenAI/Anthropic-compatible proxy between the harness and the inference engine that records the exact prompt/response **token IDs and logprobs** per model call, then stitches calls into training rows by token-prefix continuity — Agent Lightning v1.0, rLLM's gateway, NeMo Gym model servers, AReaL's online proxy, slime's adapters, verifiers' interception server, OpenRLHF's executor, ART; MiniMax's Forge describes the same decoupling. And Hermes' built-in trajectory export is **not a faithful record**: it substitutes a fixed Hermes-JSON tool-calling system prompt for the real one, re-renders tool calls as JSON, folds results, and records no token IDs. For Qwen3.8 (XML grammar, effort sentence, preserved thinking) you must capture what vLLM actually rendered. Use `batch_runner.py` to *drive* runs (prompt lists, toolset distributions), never as the data source.
+
+**Architecture:** your wrapper → gateway (records) → vLLM (`return_token_ids` / `prompt_logprobs`, `logprobs=1`). Ready-made: **Agent Lightning** (zero-code `base_url` redirect; rollout id in URL; forces train/val temperature; verl trainer), **rLLM gateway** (`/sessions/{sid}/v1`; SQLite; 6 deps), **AReaL online proxy** (chat/completions + responses + messages; per-session key; `POST /rl/set_reward`; **ships `examples/hermes`** running Hermes `AIAgent` in-process with `skip_memory`, `skip_context_files`). For SFT-only capture a ~200-line FastAPI proxy suffices.
+
+**Log per model call (instrumentation spec):**
+- *Identity:* `episode_id` (task × rollout), `trajectory_id` + `agent_role` (orchestrator / each specialist), `step_idx`, `parent_step_id` + `child_episode_id` for `delegate_task` spawns, `attempt_id`.
+- *Exact request:* API format, `model`, full `messages` as sent (system incl. memory/skills blocks; assistant turns with `tool_calls` **and** `reasoning_content`; `tool` results with ids), `tools` JSON in exact order, `tool_choice`, `parallel_tool_calls`, `chat_template_kwargs` (`reasoning_effort`, `preserve_thinking`, `enable_thinking`), sampling params, `extra_body`.
+- *Exact response:* raw generated text before parsers, `reasoning_content`, `content`, parsed `tool_calls`, `finish_reason`, usage.
+- *Tokens:* `prompt_token_ids`, `response_token_ids`, per-token `logprobs`; **fail closed** if missing (slime / NeMo Gym rule: training token IDs must come from the same request that sampled the response).
+- *Fingerprint:* tokenizer + chat-template hash, model revision, vLLM version, parser names.
+- *Harness events (from your wrapper's hooks, not the gateway):* tool executions (raw result, truncation applied), **compaction events + carrier text**, `memory`/`skill_manage` writes, delegate spawn/return (child ids, returned summary), verifier outputs/rewards, wall-clock, cost.
+
+**Store as ATIF** (Agent Trajectory Interchange Format v1.8 — the schema behind the Agent Data Protocol, ICLR 2026, ~1.3M unified trajectories, ~20% average gains). It already has `reasoning_content`, `reasoning_effort`, `tool_calls` / `observation.results` bound by `source_call_id`, `subagent_trajectory_ref`, `context_management{compaction|pruning}` boundaries, per-step token IDs/logprobs, `is_copied_context` (so compaction turns are excluded from loss) and `final_metrics`. Add in `extra`: `task_id`, `task_family`, `split`, `source{prod_log|demo|synthetic-<pipeline>|self_play, teacher, prompt_version}`, `license`, `environment{harbor_task_ref, mcp_servers[{name,version}], fixture_id}`, `verifier{reward, reward_json, passed}`, `rubric_scores`, `human_review`, `redaction`, `dedup_hash`, `role`, `skills_loaded[]`; per step `irreversible: bool`, `user_confirmation_obtained`. Stage ADP-style: raw → ATIF → std (canonical tool names) → `std_to_sft.py` per renderer.
+
+**Token-exact rules.** Never re-tokenize text; train on captured ids. If you must re-render (converting old logs), render with the *served* `chat_template.jinja` and identical `chat_template_kwargs`, then assert equality against captured ids per turn (verl `tokenization_sanity_check_mode=strict`). **Masking:** loss=1 only on assistant-generated tokens (`<think>…</think>`, visible text, `<tool_call>` XML, `<|im_end|>`); loss=0 on system (effort sentence, tools, memory/skills), user, `<tool_response>`, re-fed prior reasoning, compaction carriers, steering markers; zero-mask malformed turns (Tinker `parse_error_masked`); when a prompt is not a token-prefix extension of the previous call (compaction, history edit, delegate child) start a **new segment** and count shared generated prefixes once.
+
+**Two Hermes-specific fixes before capturing anything:**
+1. **Reasoning replay.** Stock Hermes strips `reasoning`/`reasoning_content` from prior assistant messages on custom routes. With Qwen3.8's `preserve_thinking` default that makes serving diverge from the model's own training distribution and from your SFT renders. Patch your wrapper to pass `reasoning_content` back (the model card's own Chat Completions example does exactly this).
+2. **Model-name gating.** A served model id containing `qwen` makes Hermes inject "Tool-use enforcement" + execution-discipline blocks. Choose a custom name (or pin `agent.tool_use_enforcement` / `agent.execution_guidance`) and freeze the resulting system prompt across data generation, training and serving. Hermes' tiered system prompt (stable / context / volatile) is never re-rendered mid-session — good for prefix caching and for stable training prompts.
+
+## III.3 Step 2 — Environment: seeded sandboxes and a verifiable task bank
+
+Every executed-episode method needs somewhere to execute, and every verifier needs a known initial state. This is also your eval suite.
+
+- **One sandbox per integration** (CRM, ESP, ads, analytics, CMS, social, DAM, internal KB): mock MCP server or sandbox tenant with seeded fixtures (contacts, campaigns, budgets, analytics rows) and snapshot/reset. Pin MCP server versions.
+- **Task layout — adopt Harbor's**: `instruction.md` + `task.toml` (`[environment].mcp_servers`, `skills_dir`, verifier timeout/network) + `tests/test.sh` → `reward.json`; RewardKit TOML for rubric judging (binary/likert/rubric criteria, weighted aggregation). Harbor supports MCP servers and skills directories natively, and both Harbor and NeMo Gym ship a **Hermes harness adapter**, so one task bank drives data generation, RL and eval.
+- **How to author tasks (evidence):** MCPMark — 127 tasks, each `meta.json` + `description.md` + `verify.py` over realistic initial states, human–AI co-design + expert cross-review; AppWorld — DB-state checks "without collateral damage", programmatic variant generators (250 scenarios × 3); WorkArena++ — 682 compositional tasks each sampling thousands of configurations; τ² — reward = DB-state match × communication checks × env assertions, derived by replaying a reference action sequence; TheAgentCompany — checkpoint graders for partial credit; **Holo4 — "a task survives only if its verifier rejects near misses"**; **AutoSynthData — positive verification (reference passes) *and* negative verification (mutated wrong outcomes fail)**; **AutoGym — write the solution space and verification rules *before* building the environment: $2–8 and ~15 min per task vs $500–1,000 and 1–1.5 h for expert authoring; 80–92% survive repair [S]**.
+- **Marketing task families (~15):** campaign setup & QA · audience/segment building · budget reallocation & pacing · performance reporting with computed numbers · attribution questions · subject-line / creative A/B · content calendar & brief · lifecycle/journey edits · lead routing & CRM hygiene · SEO audit & brief · social scheduling · brand-compliance review · approval requests · incident triage (over-spend, broken UTM) · cross-tool reconciliation (ads ↔ analytics ↔ CRM). Cross with personas (CMO, demand-gen, lifecycle, paid media, SEO, brand, analyst, SDR) and tool states (missing permission, stale data, duplicate campaign, API error, ambiguous ask).
+- **Counts:** 100–300 hand-validated tasks (MCPMark / TheAgentCompany scale) and 10³–10⁴ programmatic variants (AppWorld / WorkArena++ scale). Hold out whole families and whole workflows.
+
+## III.4 Step 3 — Generate episodes: the full menu
+
+"Fit" = how directly it applies to your system.
+
+**A. From real usage**
+
+| Method | How, concretely for you | Evidence / scale | Fit |
+|---|---|---|---|
+| A1 Production-log mining | Gateway-captured sessions → scrub → dedup → rejection-sample with verifiers/judges → SFT; thumbs → KTO; edits/approvals → DPO pairs | Kimi K2 "large-scale rejection sampling"; KTO works on binary labels [S]; Cursor/Shopify loops | **Highest** — your real task distribution |
+| A2 Human demonstrations ("teach mode") | Marketers do real tasks in the sandboxes with the agent in shadow/assist; capture via gateway; review/trim UI; rubric-score (RewardKit) | AgentNet recorder pattern (22.6K tasks); expert task authoring costs $500–1,000 [S] → expect tens to low hundreds of gold episodes/month from a few hours/week | High — gold evals, seeds, preference anchors |
+| A3 Corrections & overrides | Store (agent output, user edit/override) pairs; annotator-steered live rollouts | UI-TARS online bootstrapping; PRELUDE edit feedback | Medium–high |
+
+**B. Executed synthetic (teacher-driven, verified)**
+
+| Method | How | Evidence / scale | Fit |
+|---|---|---|---|
+| B1 Teacher runs through *your* wrapper | Frontier/open teacher drives your wrapper via `batch_runner`-style prompt lists against the sandboxes; τ²-style user simulator with structured `known/unknown_info`; keep verifier-passed | APIGen-MT (~5k → τ-bench-leading), Toucan (1.5M, real MCP), Holo (filtered BC), Fara1.5 (~2M samples, 3 verifiers) | **Highest** — the bulk SFT corpus |
+| B2 Execution-first → reverse-synthesize the task | Let an agent explore valid tool-call sequences in the sandbox; then write the user intent that would produce them; keep verifier-passed | Trajectory2Task (ACL 2026), SyntheticAgentTraceQA, NNetNav retroactive labeling [S] | **High** — safest for tools with side effects |
+| B3 Skill-grounded synthesis | Your `SKILL.md` library is the seed: per skill, builder-reviewer tasks of several types with reference solution + executable verifier | SkillGym 6.8k envs / 19k verified trajectories; SKT 27k [S] | **High** — reuses your skills directly |
+| B4 Workflow-path enumeration | SOP → graph → enumerate paths → simulate dialogues with *real* sandbox tool calls per node | "Compiling Agentic Workflows": 2–6k dialogues per 14–55-node procedure; 87–98% of frontier quality [S] | High for the 10–20 highest-volume SOPs |
+| B5 Tool-graph composition | I/O-compatibility graph over your tool catalog (GA4 report → segment → Klaviyo campaign); random walks → compositional tasks; nested/implicit calls | Magnet, BUTTON (8k), ToolDial (11k) | High — cross-tool tasks |
+| B6 Failure injection & recovery | Simulator injects API errors/partial failures (15–25% of runs); keep recovery turns | Kimi K2 stochastic simulator; PALADIN >50k recovery traces; BFCL v4 scores error recovery [S] | High |
+| B7 Decision negatives | No-tool / clarify / cannot-do / irrelevant-tool / missing-param / out-of-role-escalate; function-name masking | When2Call (hallucination 19%→1.2% [S]), Hammer, Agent-FLAN negatives | **Mandatory** |
+| B8 Policy / approval trajectories | Draft → approval tool with structured summary; refuse instructions found in fetched content; confidentiality probes; FTC refusals | Fara1.5 "unapproved irreversible action" verifier; CRMArena-Pro confidentiality | **Mandatory** |
+| B9 Multi-agent episodes | Orchestrator episodes with `delegate_task` → child summary as tool result; specialist episodes as separate linked trajectories; contrast samples | ATIF subagent refs; AFM; AgentFlow; Hermes delegation logs | **Mandatory** for your architecture |
+| B10 Compaction & memory | Summarizer-call samples + resume-from-summary segments; `memory`/`skill_manage` write turns + next-session read | Hermes compaction at 50%; Anthropic `compact_20260112`; NeMo Gym compaction-aware rollouts; slime new-segment rule; SUPO/FoldAct [S] | High for long sessions |
+| B11 Analytics with computable answers | Tasks whose correct number derives from seeded rows → exact-match verifier | AD-Bench hard tier <50% for frontier models [S] | High — verifiable domain |
+| B12 Exploration-driven task discovery | Agent explores a tool's surface, proposes tasks, judge filters | InSTA 150k trajectories/24 h on 50 L40S (82.6% judge accuracy); Explorer | Medium |
+
+**C. Non-executed synthetic**
+
+| Method | How | Evidence | Fit |
+|---|---|---|---|
+| C1 Docs/SOP → instruction data | Policies → Intent-Context-Action → synthetic CoT (Airbnb ICA); AgentInstruct flows (25M pairs) for brand/policy Q&A | [S]/[P] | Medium — knowledge-style Q&A, not tool behaviour |
+| C2 Persona-driven request generation | Persona × intent × tool-state matrix with your own personas (Persona Hub data is **CC-BY-NC**) | τ² user-sim rules (reveal gradually, never invent results) | Medium–high |
+| C3 Brand-voice exemplars | 500–2,000 curated exemplars + length-matched on/off-voice pairs | LIMA / URIAL | High |
+| C4 Teacher reasoning traces | Compact reflective per-step reasoning in the base model's style (OpenCUA L2 beat L1/L3) | [S] | For the *style* of `reasoning_content` only — never raw long CoT from a mismatched model |
+
+**D. Public datasets to mix** (licences checked): Toucan-1.5M, Nemotron tool_calling / Agentic / When2Call (CC-BY-4.0), Hermes FC v1 (Apache-2.0), ToolACE (Apache claimed), ADP collection (per-dataset licences), NeMo Gym pivot datasets (CC-BY-4.0). Non-commercial — imitate only: APIGen-MT, Magpie, xlam-60k, ToolBench, ActionStudio data, Persona Hub.
+
+**E. Self-evolution (month 3+)**: AutoSynthData-style failure-targeted task generation with positive **and** negative verification (2,000 samples → +7.2 Pass@1 [S]); hermes-agent-self-evolution (GEPA over `SKILL.md`, ~$2–10/run); avoid pseudo-label-only self-play for open-ended marketing outputs.
+
+**Order for your situation** (logs exist · SOPs documented · many MCP integrations · sandboxable tools · marketers a few hours/week): A1 → task bank (§III.3) → B1 + B7 + B8 → B9 + B10 → B3 → B2 / B5 → B4 (top SOPs) → A2 continuously → E later.
+
+## III.5 Step 4 — Verify and curate
+
+Filter stack, in order: (1) **rules** — schema-valid XML/args, no unknown tools/params, call order intact, no failure patterns, reasoning present (Hermes drops zero-reasoning samples); (2) **state verifier** — end state matches blueprint, no collateral damage (AppWorld), communication checks (τ²); (3) **Fara1.5's three verifiers** — universal LLM judge on the rubric (order-swapped, "Unknown" option), efficiency / redundant-action filter, **critical-point adherence** (missing info, ambiguity, unapproved irreversible action → fail); (4) dedup (MinHash + semantic); (5) PII scrub (Presidio + allow/deny lists + hand sampling); (6) n-gram decontamination against the eval suite; (7) **human audit ≥600 samples at ≥95% accept**. Split by **task family, workflow and integration version**; hold out whole SOPs and whole roles. Expect **10–20k verified company episodes for v1** (APIGen-MT ~5k, ToolACE 11.3k, SWE-smith 5k of 26k → +32 pts); scale to 50–100k via B2/B3/B5 for v2.
+
+## III.6 Step 5 — Represent multi-agent, workflows and long sessions
+
+**Multi-agent (orchestrator + specialists)**
+- **One model, role by system prompt** — the evidence-backed default: MiniMax trains one model across >100k scaffolds and reports out-of-distribution harness generalization; AFM distils a multi-agent system into one stream; Hermes itself runs orchestrator and leaf children on one model with different system prompts and toolsets.
+- **Separate, linked trajectories per role** (ATIF `subagent_trajectory_ref`): the orchestrator's sample contains `delegate_task` `<tool_call>` → `<tool_response>` with exactly the JSON Hermes returns (`status, summary, exit_reason, truncated, schema_valid`); the child's run is its own trajectory with its own system prompt and reduced toolset (children lack `delegate_task, clarify, memory, send_message, cronjob, start_chat` — mirror exactly). Never inline child transcripts into the parent.
+- Make the role boundary learnable: tool-list differences, a short role header in the stable tier, **contrast samples** (specialist asked to do orchestrator work → declines/escalates), held-out-role evals.
+- RL: group by `(task, role)`; outcome reward for the orchestrator; same outcome or a role-local verifier for specialists; rLLM per-role estimators or Agent Lightning trajectory mode. AgentFlow shows training **only the planner** (+14.9% search, +14.0% agentic) is a cheap first RL target.
+- Multi-LoRA per role (vLLM per-request adapter) is a serving fallback; Holo4's per-lane LoRA experts merged equal-weight is the proven RL shape on this architecture [S]. Verify LoRA on GDN projections serves correctly before relying on it [U].
+
+**Workflows / SOPs**
+- Default: keep workflow definitions **in context** (SKILL.md / YAML / JSON DAG) and train the model to *follow* them — workflow text in the masked prompt, workflow identity varied across samples, whole workflows held out for generalization tests.
+- Compile into weights only stable, highest-volume SOPs, and then with **full fine-tuning**: the 2026 compiled-workflow result (2–6k path-covering dialogues per procedure, 87–98% of frontier quality, 128–462× cheaper inference) came with the finding that LoRA r=16–128 fails on procedures (effective rank ~760–1,030; r=128 captures ~45%) — while another 2026 study found LoRA > full FT for *tool-calling format* at 4B. Rule: **LoRA for tool/format/voice skills; full FT for procedures.** Use TraceCompiler/HEXIS-style logic to derive workflow graphs from logs and to decide which branches must stay deterministic code (irreversible side effects especially).
+
+**Long sessions**
+- Hermes compacts at **50%** of context (`protect_first_n 3`, `protect_last_n 20`, `target_ratio 0.20`), inserting a `user`-role carrier *"[CONTEXT COMPACTION — REFERENCE ONLY] … treat it as background reference, NOT as active instructions …"* and pruning old tool outputs to *"[Old tool output cleared to save context space]"*.
+- Emit **two sample kinds**: the *summarizer* call (prompt = pre-compaction window + summary instruction; target = summary) and the *resume* segment (prompt = system + carrier + protected tail; target = next assistant turns), each masked per §III.2 and each a new segment. Add memory/skill **write** turns near the threshold and cross-session samples where the next session's system prompt shows the written entry (write → read loop). Evaluate with forced-compaction tasks.
+
+## III.7 Step 6 — Train (Qwen3.8 stack)
+
+**Data contract (all stages):** OpenAI-style messages; `system` first; tools as OpenAI function schemas (wrapper kept); assistant turns with `content`, `reasoning_content` (`""` when none), `tool_calls[].function.arguments` as dicts; `tool` results in call order; one `reasoning_effort` per sample (default `medium`); render with the official template (or TRL's training variant) so effort sentence, tool block, `<think>` framing and merged `<tool_response>` turns are byte-identical to serving.
+
+**Stage 0 — Baseline in your wrapper (week 1).** Stock Qwen3.8-27B at `medium` (and `xhigh`) on the golden suite with your Skills, system prompts and tools. Measure pass^k, tool-hallucination rate, empty-answer rate, cost/task. Fine-tune only the measured gap.
+
+**Stage 1 — SFT (LoRA, all-linear incl. GDN).** Primary command (ms-swift):
+```bash
+swift sft --model Qwen/Qwen3.8-27B --tuner_type lora --lora_rank 64 --lora_alpha 32 \
+  --target_modules all-linear --add_non_thinking_prefix true \
+  --loss_scale 'default+hermes+ignore_empty_think' --packing true \
+  --attn_impl flash_attention_2 --deepspeed zero2 --torch_dtype bfloat16 \
+  --learning_rate 1e-4 --warmup_ratio 0.05 --num_train_epochs 2 --max_length 32768 \
+  --dataset your_episodes.jsonl   # rows carry {"chat_template_kwargs": {"reasoning_effort": "medium"}}
+```
+Hyperparameters per Part I (r=64–128, LR 1e-4 sweep 5e-5–2e-4, effective batch 16–32, 2–3 epochs, select by eval). Mix: company episodes 30–40% · public tool data 30–40% · base-regenerated general replay 20–30% · voice + negatives fixed slices. Cheap iteration: Unsloth 27B notebook (QLoRA, never fp16). Full FT (compiled workflows): NeMo AutoModel `qwen3_8_27b.yaml` on 8×H100 or Megatron-SWIFT.
+
+**Stage 2 — Recover general ability (OPD, 100–200 steps).** Teacher = original Qwen3.8-27B via `swift deploy --model Qwen/Qwen3.8-27B --infer_backend vllm --max_logprobs 64`; student: `swift rlhf --rlhf_type gkd --model <stage1> --teacher_model_server http://… --gkd_logits_topk 64 --tuner_type lora --use_vllm true --vllm_mode colocate --lmbda 1 --beta 0.5 --max_completion_length 8192` on general prompts. Gate on IFBench/IFEval.
+
+**Stage 3 — Preference.** Length-normalized DPO on success-vs-failed, correct-vs-wrong decision, on/off-voice pairs; KTO on production thumbs. Evidence it works on this model: a community r=16 DPO LoRA [S].
+
+**Stage 4 — RL through your harness.** Choose by infra:
+
+| Option | Mechanism | Trainer | Model support | LoRA | When |
+|---|---|---|---|---|---|
+| **slime** | Anthropic/Responses/OpenAI adapters; token-in/token-out; `TrajectoryManager` masks tool/user, bridges prefixes, new segment on compaction | Megatron + SGLang | **Qwen3.8-27B example exists** (16 GPUs + 2 sandbox nodes) | no | Full-FT RL, Megatron-class GPUs |
+| **Agent Lightning** | Zero-code gateway (`base_url` redirect), rollout id in URL, `include_log_probs`, trajectory-mode stitching by token continuity | verl + vLLM | Qwen3.5 examples (same arch) | not documented | Fastest zero-code path |
+| **AReaL online proxy** | chat/completions + responses + messages; per-session key; `POST /rl/set_reward`; **`examples/hermes`** | Megatron / FSDP | Qwen3.5 listed | yes | Hermes-native example |
+| **rLLM** | Custom harness class or `@rllm.rollout`; per-role trajectories `{task_id}:{name}` with per-role estimators | verl / **Tinker** | via backend | via Tinker | Per-role credit assignment |
+| **Tinker** | Hosted LoRA RL/OPD; Qwen3.8 effort renderers; multi-turn tool-use recipes | hosted | **Qwen3.8-27B** | LoRA only | Zero infra |
+| **prime-rl + verifiers** | Interception server; `[renderer] qwen3.8`; async | FSDP2 + vLLM | Qwen3.5 listed (confirm 3.8 load) | yes | What Holo4 used [S] |
+| **NeMo Gym + NeMo RL** | `hermes_agent` harness adapter; `ng_trajectory`; 2-node Qwen3.8-27B GRPO yaml | NeMo RL | Qwen3.8-27B | yes | Multi-node; Nous fork available |
+
+Rewards and settings per Part I Stage 4 (gated decomposed rewards, −1 for unapproved irreversible actions, efficiency term, token budgets, DAPO components, LoRA r≤32, PTX/OPD anchor, shuffled-reward ablation). Group by `(task, role)`; start with planner-only RL (AgentFlow), then specialists or Holo4-style per-lane experts.
+
+**Stage 5 — Merge → quantize → eval served → serve.** Merge to BF16 (confirm `mtp.*` tensors and `tokenizer_class` survive — Unsloth #7681 class of bugs); FP8-dynamic via llm-compressor (keep `visual.*`, `lm_head`, `embed_tokens`, `linear_attn.in_proj_a/b` unquantized); eval the served artifact; serve with the §III.1 command; client-side tool-name validation + de-dup in your wrapper (#58147); `frequency_penalty 0.3` if empty answers appear.
+
+## III.8 Step 7 — Evaluate (the ops suite)
+
+- **Seeded sandbox per integration**, task = `{meta, description, init_state, verify.py}` (MCPMark layout); verifiers check end state **and no collateral damage** (AppWorld) and, for customer-facing actions, **communication checks** (τ²). Headline metric **pass^k (k=3–4)**; also pass@1, avg@k, steps, tokens, wall-clock, **cost/task** (Hermes Index style). Best-of-N only for rejection sampling, never for reporting.
+- **Multi-agent slices:** orchestrator-only (delegation plan correct, child results schema-valid), specialist-only (role boundary: refuses out-of-role tools / escalates), end-to-end; **held-out workflows** (unseen SOP/YAML) and **held-out roles**.
+- **Long-horizon slice:** forced compaction (cap context so ≥1 compaction occurs); **cross-session memory** (write in A, must use in B).
+- **Rubric + human:** Claw-Eval-style human-verified rubrics (300 tasks / 2,159 rubric items; Completion / Safety / Robustness; Pass^3) graded by an LLM judge, with a fixed human sample per release and inter-rater checks; TheAgentCompany-style sub-checkpoints for partial credit.
+- **Regression & hygiene:** IFBench/IFEval, MMLU-Pro, GPQA within ±1–2 pts; BFCL v4 subset, τ²-bench; pin environment versions and verifiers; re-verify stored rollouts; **use the same harness + gateway for eval and training** so numbers transfer.
+
+## III.9 Costs and timeline (architecture identical → Part I/II numbers hold)
+
+- SFT v1 (10–20k episodes × ~8k tokens, 2–3 epochs): **$250–400** on 1×H100/H200 (LoRA) or ~$220 on 8×H100; Unsloth 4-bit fits 2×16 GB at 1k seq for smoke tests.
+- Full FT for compiled workflows (≤500M tokens): **~$340–450** on 8×H100/H200 (NeMo AutoModel config exists).
+- OPD recovery: 100–200 steps, **<$300**.
+- RL through the harness: **$2.2–4.3k per 500 steps** on one 8×H100 node (LoRA path); sandboxes extra ($0.17–0.46/VM-h).
+- Task bank: 100–300 tasks at AutoGym-style $2–8 each in LLM cost + human review ≈ **$1–3k** + engineer time (expert-authored tasks are $500–1,000 each [S] — automate authoring, keep humans for review).
+- Teacher episode generation: 10–100k episodes; cost dominated by teacher inference and sandbox time (InSTA: 150k trajectories / 24 h on 50 L40S) — **$2–10k** for v1 depending on teacher (open-weight teacher avoids provider-terms questions; Part I §4.3).
+
+| Weeks | Deliverable |
+|---|---|
+| 0–2 | Gateway capture live in your wrapper (ATIF store, redaction, dedup); reasoning-replay patch; model-name / system-prompt freeze; Stage-0 baseline at `medium` vs `xhigh` |
+| 1–6 | Sandboxes per integration (Harbor layout); 100–300 verified tasks + variants; user simulator; teacher episodes (B1), negatives (B7), policy (B8), multi-agent (B9), compaction (B10) |
+| 4–8 | Log mining (A1) → SFT/KTO/DPO sets; skill-grounded (B3) and reverse-synthesis (B2) batches; human teach-mode (A2) weekly |
+| 6–9 | Stage 1 SFT + Stage 2 OPD; eval gates; iterate on failure clusters |
+| 8–11 | Stage 3 DPO/KTO; merge → FP8 → served eval; shadow mode read-only in production |
+| 10–16 | Stage 4 RL through the harness (planner-first, then specialists / per-lane experts); workflow compilation (B4) for top SOPs with full FT; A/B with gated writes |
+| ongoing | Flywheel: production → scrub → judge → SFT/KTO/DPO → re-gate; GEPA skill evolution; failure-targeted task synthesis (E) |
+
+## III.10 What I need from you to make this concrete
+1. Your wrapper's tool schemas (exact JSON), per-role system prompts, and one captured example of the request your wrapper actually sends.
+2. Workflow/SOP definitions (format + the 10–20 highest-volume ones).
+3. Volume/format of existing logs; whether thumbs/edits/approvals are captured.
+4. Which integrations are sandboxable today; which writes the agent should perform vs draft.
+5. GPU access/budget; whether hosted LoRA (Tinker) is acceptable.
+6. Legal position on teacher-model terms and customer data in training.
+
+## III.11 Caveats specific to this Part
+- Qwen3.8 template facts are from TRL's vendored copy of the shipped template (TRL runs a weekly drift check; none detected) — re-diff against the HF file before training.
+- Holo4 training details (prime-rl, LoRA experts, merge) are from H's newsroom via search snippets [S]; the model card itself was unreachable.
+- 2026 arXiv papers cited (compiled workflows, LoRA-on-procedures, Trajectory2Task, SkillGym/SKT, AutoGym, AutoSynthData, SFT-vs-RL study, Rethinking OPD, SUPO/FoldAct) are [S] — open them before quoting numbers.
+- prime-rl / Agent Lightning / AReaL list Qwen3.5 (same architecture) but not 3.8 by name — confirm the hybrid loads in the trainer before committing GPUs.
+- Whether vLLM serves *unmerged* LoRA on GDN projections correctly is unverified — merge for production.
+
+## III.12 Glossary
+**SFT** supervised fine-tuning: imitate recorded good turns · **DPO / KTO** preference training from (better, worse) pairs / binary thumbs · **OPD / GKD** on-policy distillation: student samples, teacher's token distribution corrects it; used here to restore general ability after domain SFT · **GRPO / DAPO** RL that scores groups of sampled episodes against verifiers/judges · **LoRA** small trainable adapters; **full FT** all weights · **Verifier** program that checks sandbox end state · **Judge** LLM scoring a rubric · **pass^k** probability all k attempts succeed (reliability) · **Gateway** proxy recording exact model calls with token IDs · **ATIF / ADP** standard trajectory schema / pipeline · **Compaction** Hermes summarizing old context at 50% · **reasoning_effort** Qwen3.8's `xhigh|medium|low` thinking-budget sentence · **preserve_thinking** keep prior-turn reasoning in the prompt · **Harbor** containerized task + verifier format with MCP support · **GDN** Gated DeltaNet linear-attention layers (48 of 64 in this model).
+
+---
+
 ## Appendix A — Flagged / unverified items
+- **Part III:** see §III.11.
 - **Part II:** Holo4-27B and Holo2-30B-A3B licences [U]; all Holo compute/cost reconstructions [U-arith]; Qwen3.6-27B OSWorld-Verified 63.9 is relayed from the Qwen3.8-27B card [S]; Holo1.5 release date conflicts across H pages; whether vLLM accepts `image_url` parts on `tool`-role messages for Qwen3.6 [U]; sandbox/browser pricing figures [S].
 - Paper numbers marked [S] (Gekhman, Ovadia, EntiGraph, LoRA-Without-Regret blog figures, "Procedural Knowledge Is Not Low-Rank", OPD recovery numbers, Ibrahim replay ratios, When2Call deltas, ToolRL deltas, KTO claims, τ-bench numbers, Creativity Benchmark, AD-Bench, CRMArena-Pro) come from abstracts/snippets — arxiv.org and huggingface.co were blocked in this sandbox.
 - Unsloth 56 GB LoRA figure and Tinker pricing/retirement dates [U].
@@ -384,6 +631,8 @@ Replicating Holo4 end-to-end is therefore a **$0.3–0.6M compute-equivalent, mu
 - No published documented agentic SFT recipe for Qwen3.6-27B exists yet; closest is Mercor's SkyRL RL run on Qwen3.6-35B-A3B [S].
 
 ## Appendix B — Key sources
+**Part III:** Qwen3.8-27B model card (verbatim mirror at github.com/khimaros/aimbot/…/Qwen_Qwen3.8-27B.md); TRL `trl/chat_templates/qwen3_8.jinja` + `qwen3_8_training.jinja` + README; QwenLM/Qwen3.8 README; vLLM recipe `Qwen/Qwen3.8-27B` + `chat_completion/protocol.py` + issues #58147/#55420; QwenLM/Qwen3.8 issues #216/#217; ms-swift `Qwen3_8-Best-Practice.md`, `swift/template/templates/qwen.py`, PRs #9914/#9920/#9972; LLaMA-Factory `template.py`/`tool_utils.py` (`qwen3_8`); Axolotl `examples/qwen3.8/27b-qlora.yaml` (PR #3935); Unsloth notebooks `Qwen3.8_(27B)-Conversational/GRPO` + issues #10010/#12737/#7681; NeMo AutoModel `qwen3_8_27b{,_lora}.yaml`, Megatron-Bridge `qwen3.8-27b.md`, NeMo RL `grpo-qwen3.8-27b-2n8g-megatron-tp4pp2cp2.yaml`; Tinker cookbook `model_info.py`, `renderers/qwen3_8.py`; verl `run_qwen3_8_27b_megatron.sh`, `docs/advance/agent_loop.rst`; prime-rl `docs/training.md`, PrimeIntellect renderers `qwen38.py`; slime `examples/coding_agent_rl`; llm-compressor `qwen3_8_gptq_awq_example.py`; Agent Lightning docs (05/20/25/35); rLLM docs + model gateway; NeMo Gym `responses_api_agents/hermes_agent`, `vllm_model_with_compaction`; AReaL `online_proxy.md` + `examples/hermes`; SkyRL; verifiers v1 docs; OpenPipe ART; OpenRLHF; ROLL; Hermes Agent source (`batch_runner.py`, `agent/agent_runtime_helpers.py`, `agent/context_compressor.py`, `agent/compaction_events.py`, `agent/system_prompt.py`, `tools/delegate_tool.py`, `tools/memory_tool.py`, `tools/skill_manager_tool.py`); Harbor RFC 0001 (ATIF) + RFC 0002 + RewardKit; neulab/agent-data-protocol (`schema/atif.py`, consistency audit); OPPO Agent Foundation Models; lupantech/AgentFlow; microsoft/fara (FaraGen1.5); MCPMark; AppWorld; TheAgentCompany; τ²-bench; WorkArena; SWE-smith; NVIDIA-NeMo/Gym; xlang-ai AgentTrek/OpenCUA/AgentNet; data-for-agents/insta; NNetNav; Synatra; AgentGym(-RL); R-Zero; Absolute Zero; persona-hub; AgentTuning; Agent-FLAN; AgentRefine; Klear-AgentForge; hermes-agent-self-evolution; OTel GenAI semantic conventions; OpenAI Agents SDK tracing; Claw-Eval; SkillsBench. Secondary [S]: arXiv 2605.22502, 2607.21612, 2609.17848, 2604.13016, 2608.02680 (TraceCompiler), 2609.30123 (HEXIS), 2609.37539/2608.02287 (SkillGym/SKT), 2609.22592 (AutoGym), EnterpriseOps-Gym/AutoSynthData, Trajectory2Task, SyntheticAgentTraceQA, SUPO, FoldAct, Context-Folding, Agent Lightning paper 2508.03680, CoA 2508.13167; hcompany.ai newsroom (Holo4).
+
 **Part II:** H Company GitHub (`hcompai/surfer-h-cli`, `hai-cookbook`, `holo-desktop-cli`, `hai-agents-python`, `agents-api-demos`, `android-world-traces`); Holo model cards / H newsroom / HF blogs via search (Holo1 arXiv 2506.02865; Surfer 2 arXiv 2510.19949; hcompany.ai/newsroom/holo3, holo3.1, holo4); ByteDance UI-TARS paper PDF (repo); OpenCUA repo; QwenLM/Qwen3-VL cookbooks (`computer_use.ipynb`, `agent_function_call.py`); Tongyi-MAI/MAI-UI; X-PLUG GUI-Owl-1.5 README; Aguvis, ScaleCUA, GUI-Actor, GUI-R1 (`r1gui.py` reward), UI-R1, GTA1, ZeroGUI, ARPO scripts; OSWorld / WindowsAgentArena / AndroidWorld / WebVoyager repos; Agent S3 paper (EC2 scaling data); Hermes Agent `tools/browser_tool_vision.py`, `tools/vision_tools.py`, `agent/image_routing.py`, `tools/computer_use/schema.py`, docs `browser.md`/`vision.md`/`computer-use.md`; transformers `configuration_qwen3_5.py`; vLLM recipes `Qwen3.5.md`/`Qwen3-VL.md`, vLLM issue #40696; ms-swift, LLaMA-Factory, Axolotl, EasyR1, verl (`qwen3_5.py` patch) docs.
 
 **Part I:** Qwen3.6-27B model card (via mirror); TRL `trl/chat_templates/qwen3_6.jinja`; QwenLM/Qwen3.8 README; vLLM recipes `Qwen/Qwen3.5.md`; vLLM `tool_calling.md`, `reasoning_outputs.md`, `automatic_prefix_caching.md`; ms-swift Qwen3.8 Best Practice; Axolotl `examples/qwen3.5/`; TRL PR #7533/#7599; NousResearch/hermes-agent docs (`providers.md`, `agent-loop.md`, `trajectory-format.md`, `skills.md`, `memory.md`, `prompt_builder.py`, `chat_completions.py`, `batch_runner.py`); NousResearch/Gym, NousResearch/RL; Kimi K2 tech report PDF; Thinking Machines "LoRA Without Regret" (via TRL guide + replication) and "On-Policy Distillation" (via Tinker cookbook); Tülu 3 docs; Toucan datagen; APIGen-MT; BFCL repo; τ²-bench repo; Sierra pass^k code; Anthropic "Writing effective tools for agents", "Advanced tool use", "Agent Skills", "Demystifying evals for AI agents"; Shopify Engineering "Building production-ready agentic systems"; OWASP LLM Top 10; MCP spec 2025-06-18; EDPB Opinion 28/2024 summaries; Presidio.
